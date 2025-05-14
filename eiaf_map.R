@@ -1,101 +1,42 @@
-# R Script to Create a Choropleth Map of Colorado County Grants
+# Title: Colorado Energy Impact Grant Awards Map
+# Description: Recreates a map of Colorado counties showing energy grant awards,
+#              based on an example image and data from awards.csv.
+#              Handles NA grant amounts as 0, refined styling.
 
 # --------------------------------------------------------------------------
 # 1. INSTALL AND LOAD NECESSARY PACKAGES
 # --------------------------------------------------------------------------
-# If you haven't installed these packages yet, uncomment and run the following lines:
-# install.packages("sf")
-# install.packages("dplyr")
-# install.packages("ggplot2")
-# install.packages("readr")
-# install.packages("tigris")
-# install.packages("scales")     # For formatting numbers
-# install.packages("stringr")    # For string manipulation
-# install.packages("ggrepel")    # For non-overlapping text labels
-# install.packages("gridExtra")  # For creating table grobs
-# install.packages("patchwork")  # For combining plots
-# install.packages("cowplot")    # For extracting legends
-# install.packages("grid")       # Explicitly load grid if not already
+# Install packages if you haven't already:
+# install.packages(c("sf", "ggplot2", "dplyr", "readr", "stringr", "tigris", "scales", "shadowtext"))
 
 library(sf)
-library(dplyr)
 library(ggplot2)
+library(dplyr)
 library(readr)
-library(tigris)
-library(scales)
 library(stringr)
-library(ggrepel)
-library(gridExtra)
-library(patchwork)
-library(cowplot)
-library(grid) # Explicitly load grid
+library(lubridate)
+library(tigris) # For fetching county shapefiles
+library(scales) # For formatting numbers (e.g., dollar amounts)
+library(shadowtext) # For outlined text labels
+
+# Optional: Cache downloaded shapefiles from tigris
+options(tigris_use_cache = TRUE)
 
 # --------------------------------------------------------------------------
-# 2. LOAD AND PREPARE THE GRANT DATA
+# 2. DEFINE STYLING ELEMENTS (COLORS, LABELS)
 # --------------------------------------------------------------------------
-file_path <- "awards.csv" # Or "path/to/your/awards.csv"
-if (!file.exists(file_path)) {
-  stop(paste(
-    "Error: The file '",
-    file_path,
-    "' was not found. Please check the path.",
-    sep = ""
-  ))
-}
+# Colors picked from the example image (pale green/cyan to dark blue)
+color_palette <- c(
+  "< $100,000" = "#ffffcc",
+  "$100,000 - $500,000" = "#a1dab4",
+  "$500,000 - $1,000,000" = "#41b6c4",
+  "$1,000,000 - $5,000,000" = "#2c7fb8",
+  "> $5,000,000" = "#253494"
+)
 
-grant_data_raw <- readr::read_csv(file_path, show_col_types = FALSE)
-
-if (ncol(grant_data_raw) >= 2) {
-  colnames(grant_data_raw)[1] <- "County"
-  colnames(grant_data_raw)[2] <- "TotalGrants"
-} else {
-  stop("Error: The CSV file does not have at least two columns.")
-}
-
-grant_data <- grant_data_raw %>%
-  mutate(
-    County = stringr::str_replace(County, " County", ""),
-    County = stringr::str_trim(County),
-    TotalGrants = as.numeric(TotalGrants)
-  ) %>%
-  filter(!is.na(County) & !is.na(TotalGrants))
-
-# --------------------------------------------------------------------------
-# 3. FETCH COLORADO COUNTY GEOSPATIAL DATA
-# --------------------------------------------------------------------------
-colorado_counties_sf <- tigris::counties(
-  state = "CO",
-  cb = TRUE,
-  resolution = "500k"
-) %>%
-  st_transform(3857) # Project to a common CRS (Web Mercator often good for visualization)
-
-# --------------------------------------------------------------------------
-# 4. MERGE GRANT DATA WITH GEOSPATIAL DATA
-# --------------------------------------------------------------------------
-merged_data_sf <- dplyr::left_join(
-  colorado_counties_sf,
-  grant_data,
-  by = c("NAME" = "County")
-) %>%
-  mutate(TotalGrants = ifelse(is.na(TotalGrants), 0, TotalGrants))
-
-# Calculate centroids and extract coordinates for labels
-if (!("geometry" %in% class(merged_data_sf$geometry))) {
-  merged_data_sf <- st_set_geometry(merged_data_sf, "geometry")
-}
-merged_data_sf <- merged_data_sf %>%
-  mutate(
-    centroid = sf::st_centroid(geometry),
-    x_coord = sf::st_coordinates(centroid)[, 1],
-    y_coord = sf::st_coordinates(centroid)[, 2]
-  )
-
-# --------------------------------------------------------------------------
-# 5. CREATE GRANT CATEGORIES
-# --------------------------------------------------------------------------
-breaks <- c(0, 100000, 500000, 1000000, 5000000, Inf)
-category_labels <- c(
+# Grant categories and their order for the legend
+grant_breaks <- c(0, 100000, 500000, 1000000, 5000000, Inf)
+grant_labels <- c(
   "< $100,000",
   "$100,000 - $500,000",
   "$500,000 - $1,000,000",
@@ -103,282 +44,214 @@ category_labels <- c(
   "> $5,000,000"
 )
 
-merged_data_sf$GrantCategory <- cut(
-  merged_data_sf$TotalGrants,
-  breaks = breaks,
-  labels = category_labels,
-  right = FALSE,
-  include.lowest = TRUE
-)
-merged_data_sf$GrantCategory[
-  is.na(merged_data_sf$GrantCategory) & merged_data_sf$TotalGrants == 0
-] <- category_labels[1]
-
-
-color_palette <- c(
-  "< $100,000" = "#FEFBEA",
-  "$100,000 - $500,000" = "#E0F3DB",
-  "$500,000 - $1,000,000" = "#A8DDB5",
-  "$1,000,000 - $5,000,000" = "#72B2D7",
-  "> $5,000,000" = "#2A7FB8"
+# --------------------------------------------------------------------------
+# 3. LOAD AND PREPARE AWARDS DATA (awards.csv)
+# --------------------------------------------------------------------------
+# Load the awards data
+# Make sure 'awards.csv' is in your working directory or provide the full path.
+tryCatch(
+  {
+    awards_data_raw <- readr::read_csv("awards.csv", show_col_types = FALSE)
+  },
+  error = function(e) {
+    stop(
+      "Error reading awards.csv: ",
+      e$message,
+      "\nPlease ensure 'awards.csv' is in your working directory or provide the correct path."
+    )
+  }
 )
 
+
+# --- Data Cleaning and Aggregation ---
+# The script expects 'County' and 'AwardAmount' columns in your awards.csv file.
+if (
+  !"County" %in% names(awards_data_raw) ||
+    !"AwardAmount" %in% names(awards_data_raw)
+) {
+  stop(
+    "The 'awards.csv' file must contain 'County' and 'AwardAmount' columns. Please check your CSV file."
+  )
+}
+
+awards_data_processed <- awards_data_raw %>%
+  # Clean AwardAmount: remove '$', ',', and convert to numeric
+  mutate(
+    AwardAmount = as.numeric(str_replace_all(AwardAmount, "[\\$,]", ""))
+  ) %>%
+  # Clean County names:
+  # - Remove " County" suffix if present (e.g., "Adams County" -> "Adams")
+  # - Trim whitespace from county names
+  # - Convert to title case (e.g., "ADAMS" or "adams" becomes "Adams") to match tigris data
+  mutate(
+    County = str_to_title(trimws(str_replace_all(County, " County", "")))
+  ) %>%
+  # Group by county and sum the award amounts
+  group_by(County) %>%
+  summarise(TotalGrantAmount = sum(AwardAmount, na.rm = TRUE), .groups = 'drop')
+
 # --------------------------------------------------------------------------
-# 6. CREATE THE MAP PLOT
+# 4. LOAD COLORADO COUNTY GEOGRAPHICAL DATA
 # --------------------------------------------------------------------------
-map_plot_main <- ggplot(data = merged_data_sf) +
-  geom_sf(aes(fill = GrantCategory), color = "grey50", size = 0.2) +
-  ggrepel::geom_text_repel(
-    aes(x = x_coord, y = y_coord, label = NAME),
-    size = 2.5,
-    color = "black",
-    fontface = "bold",
-    box.padding = unit(0.25, "lines"),
-    point.padding = unit(0.2, "lines"),
-    segment.color = 'grey50',
-    segment.size = 0.3,
-    max.overlaps = Inf,
-    bg.color = "white",
-    bg.r = 0.05
+# Fetch Colorado county boundaries using tigris
+# Using cb = TRUE for cartographic boundary files (generalized for faster plotting)
+# Using resolution = "500k" for a reasonable level of detail
+colorado_counties_sf <- tigris::counties(
+  state = "CO",
+  cb = TRUE,
+  resolution = "500k"
+) %>%
+  select(County = NAME, geometry) %>% # Select and rename county name column from NAME to County
+  mutate(County = str_to_title(County)) # Ensure county names are title case for merging
+
+# --------------------------------------------------------------------------
+# 5. MERGE AWARDS DATA WITH GEOGRAPHICAL DATA
+# --------------------------------------------------------------------------
+# Perform a left join to keep all counties from the shapefile,
+# and match them with grant data. Counties with no grants will have NA for grant amounts.
+map_data <- colorado_counties_sf %>%
+  left_join(awards_data_processed, by = "County") %>%
+  # IMPORTANT: Treat counties with no grant data (NA TotalGrantAmount) as having 0 grants.
+  mutate(
+    TotalGrantAmount = ifelse(is.na(TotalGrantAmount), 0, TotalGrantAmount)
+  )
+
+# Calculate centroids for label placement *before* potential filtering
+# This ensures that labels are based on the full geometry.
+# shadowtext needs x and y aesthetics, so we extract centroids.
+map_data_centroids <- map_data %>%
+  mutate(
+    centroid_coords = sf::st_centroid(geometry), # Suppress warning for st_centroid on lon/lat
+    lon = sf::st_coordinates(centroid_coords)[, 1],
+    lat = sf::st_coordinates(centroid_coords)[, 2]
+  )
+
+# --------------------------------------------------------------------------
+# 6. CREATE GRANT CATEGORIES FOR MAPPING
+# --------------------------------------------------------------------------
+map_data_centroids <- map_data_centroids %>% # Continue with the data that has centroids
+  mutate(
+    GrantCategory = cut(
+      TotalGrantAmount,
+      breaks = grant_breaks,
+      labels = grant_labels,
+      right = FALSE, # Intervals are [min, max) e.g. [0, 100000)
+      include.lowest = TRUE # Includes values equal to the lowest break (0 in this case)
+    )
+  )
+
+# --------------------------------------------------------------------------
+# 7. CREATE THE MAP
+# --------------------------------------------------------------------------
+# Define title, subtitle, and caption text
+plot_title <- "Energy Impact Grant Awards by County"
+plot_subtitle <- "January 1, 2024 to December 31, 2024"
+plot_caption <- paste0(
+  "DOLA: ",
+  today(),
+  "\nMunicipal and Special District Grants included in their corresponding County Totals. Statewide grants excluded."
+)
+
+# Create the ggplot map
+grant_map <- ggplot(data = map_data_centroids) + # Use data with centroid coordinates
+  # County polygons, filled by grant category
+  geom_sf(
+    aes(fill = GrantCategory, geometry = geometry),
+    color = "gray30",
+    linewidth = 0.2
+  ) + # Specify geometry aesthetic for geom_sf
+
+  # County labels with white text and black outline using shadowtext::geom_shadowtext
+  shadowtext::geom_shadowtext(
+    aes(x = lon, y = lat, label = County), # Use lon and lat for position
+    color = "white", # Text color
+    bg.color = "black", # Outline color (background for the text)
+    bg.r = 0.1, # Radius of the outline effect (adjust as needed)
+    fontface = "bold", # Bold font
+    size = 4, # Font size for labels (adjust as needed)
+    check_overlap = TRUE # Attempt to avoid overlapping labels
   ) +
+
+  # Manual color scale for fill
   scale_fill_manual(
     values = color_palette,
-    name = "Total of Grants",
-    na.value = "grey90",
-    guide = guide_legend(
-      reverse = FALSE,
-      title.position = "top",
-      title.hjust = 0.5
-    )
+    name = "Total of Grants", # Legend title
+    labels = grant_labels,
+    # na.value is still good practice, though ideally all counties now have a category
+    na.value = "#DFF2F2", # Default NA counties to the lowest category color
+    drop = FALSE # Ensure all defined categories appear in the legend
   ) +
+
+  # Titles and caption
   labs(
-    caption = "Source: User-provided 2024 data"
+    title = plot_title,
+    subtitle = plot_subtitle,
+    caption = plot_caption
   ) +
-  theme_void() +
+
+  # Legend Guide
+  # guides(
+  #   colour = guide_legend(position = "left")
+  # ) +
+
+  # Theme adjustments
+  theme_void(base_family = "sans") + # Start with a minimal theme, use a generic sans-serif font
   theme(
+    # Plot title styling (centered, bold, larger size)
     plot.title = element_text(
       hjust = 0.5,
-      size = 16,
-      face = "bold",
-      margin = margin(b = 5)
+      size = 36,
+      face = "bold"
+      # margin = margin(b = 5)
     ),
+    # Plot subtitle styling (centered, adjusted size, more space below)
     plot.subtitle = element_text(
       hjust = 0.5,
-      size = 12,
-      margin = margin(b = 10)
+      size = 28
+      # margin = margin(b = 25)
     ),
+    plot.title.position = "plot",
+    # Plot caption styling (left-aligned at the bottom)
     plot.caption = element_text(
       hjust = 0,
-      size = 8,
-      color = "grey50",
-      margin = margin(t = 10)
-    ),
-    legend.position = "none"
-  )
+      size = 12,
+      margin = margin(t = 15, l = 10),
+      lineheight = 1.2
+    ), # Added left margin to caption
+    plot.caption.position = "plot", # Position caption relative to the plot area
 
-map_legend_plot <- ggplot(data = merged_data_sf) +
-  geom_sf(aes(fill = GrantCategory)) +
-  scale_fill_manual(
-    values = color_palette,
-    name = "Total of Grants",
-    na.value = "grey90",
-    guide = guide_legend(title.position = "top", title.hjust = 0.5)
-  ) +
-  theme_void() +
-  theme(
-    legend.position = "left",
-    legend.title = element_text(size = 10, face = "bold"),
-    legend.text = element_text(size = 9),
-    legend.key.size = unit(0.5, "cm"),
-    legend.box.margin = margin(0, 0, 0, 0)
-  )
+    # Legend styling (top-left inside, no border)
+    # legend.position.inside = c(1, 0.85), # Adjust x, y (0-1) for precise top-left placement
+    legend.position = c("left"), # Anchor legend by its top-left corner
+    legend.justification.left = "top",
+    legend.margin = margin(10, 0, 0, 0),
+    legend.background = element_blank(), # Remove legend background/border
+    legend.box.background = element_blank(), # Ensure no box around legend items if any
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 16),
 
-common_legend <- cowplot::get_legend(map_legend_plot)
+    # Overall plot border
+    plot.background = element_rect(color = "black", linewidth = 0.5, fill = NA), # Add border around the full plot
+
+    # Remove panel border if theme_void doesn't fully remove it (it usually does)
+    panel.border = element_blank(),
+    # Add some margin around the entire plot (inside the overall border)
+    plot.margin = margin(15, 15, 15, 15) # top, right, bottom, left margins
+  )
 
 # --------------------------------------------------------------------------
-# 7. PREPARE DATA AND CREATE THE TABLE OF GRANTS
+# 8. DISPLAY THE MAP
 # --------------------------------------------------------------------------
-table_data <- grant_data %>%
-  filter(TotalGrants > 0) %>%
-  arrange(desc(TotalGrants)) %>%
-  mutate(TotalGrantsFormatted = scales::dollar(TotalGrants, accuracy = 1)) %>%
-  select(County, TotalGrantsFormatted)
+print(grant_map)
 
-n_rows_total <- nrow(table_data)
-n_rows_col <- ceiling(n_rows_total / 2)
-
-table_df1 <- table_data[1:n_rows_col, ]
-table_df2 <- if (n_rows_total > n_rows_col) {
-  table_data[(n_rows_col + 1):n_rows_total, ]
-} else {
-  data.frame(County = character(0), TotalGrantsFormatted = character(0))
-}
-
-if (nrow(table_df1) > nrow(table_df2)) {
-  diff_rows <- nrow(table_df1) - nrow(table_df2)
-  padding_df <- data.frame(
-    County = rep("", diff_rows),
-    TotalGrantsFormatted = rep("", diff_rows)
-  )
-  table_df2 <- rbind(table_df2, padding_df)
-} else if (nrow(table_df2) > nrow(table_df1) && nrow(table_df1) > 0) {
-  diff_rows <- nrow(table_df2) - nrow(table_df1)
-  padding_df <- data.frame(
-    County = rep("", diff_rows),
-    TotalGrantsFormatted = rep("", diff_rows)
-  )
-  table_df1 <- rbind(table_df1, padding_df)
-}
-
-
-final_table_df <- cbind(table_df1, table_df2)
-colnames(final_table_df) <- c("County ", "$ Amount", " County", "$ Amount ")
-
-ttheme_minimal <- gridExtra::ttheme_minimal(
-  core = list(
-    fg_params = list(cex = 0.7, hjust = 0, x = 0.05),
-    bg_params = list(fill = "white", col = "grey70")
-  ),
-  colhead = list(
-    fg_params = list(cex = 0.7, fontface = "bold"),
-    bg_params = list(fill = "grey90", col = "grey70")
-  )
+# To save the map to a file:
+ggsave(
+  "energy_grants_map_final_na_handled.png",
+  plot = grant_map,
+  width = 11,
+  height = 8.5,
+  dpi = 300,
+  bg = "white"
 )
-
-if (nrow(final_table_df) > 0 && ncol(final_table_df) > 0) {
-  table_grob_full <- gridExtra::tableGrob(
-    final_table_df,
-    rows = NULL,
-    theme = ttheme_minimal
-  )
-  table_title_grob <- grid::textGrob(
-    "Table:",
-    gp = grid::gpar(fontsize = 11, fontface = "bold"),
-    hjust = 0,
-    x = 0.05
-  )
-  table_with_title_grob <- gridExtra::arrangeGrob(
-    table_title_grob,
-    table_grob_full,
-    ncol = 1,
-    heights = grid::unit.c(unit(2, "lines"), unit(1, "npc") - unit(2, "lines"))
-  )
-} else {
-  table_with_title_grob <- grid::textGrob(
-    "No grant data to display in table.",
-    gp = grid::gpar(fontsize = 10)
-  )
-}
-
-max_table_rows_display <- 20
-if (n_rows_col > max_table_rows_display) {
-  n_rows_col_display <- max_table_rows_display
-  table_df1_display <- table_data[1:n_rows_col_display, ]
-  table_df2_display <- if (n_rows_total > n_rows_col_display) {
-    table_data[
-      (n_rows_col_display + 1):min(n_rows_total, 2 * n_rows_col_display),
-    ]
-  } else {
-    data.frame(County = character(0), TotalGrantsFormatted = character(0))
-  }
-
-  if (nrow(table_df1_display) > nrow(table_df2_display)) {
-    diff_rows <- nrow(table_df1_display) - nrow(table_df2_display)
-    padding_df_display <- data.frame(
-      County = rep("", diff_rows),
-      TotalGrantsFormatted = rep("", diff_rows)
-    )
-    table_df2_display <- rbind(table_df2_display, padding_df_display)
-  } else if (
-    nrow(table_df2_display) > nrow(table_df1_display) &&
-      nrow(table_df1_display) > 0
-  ) {
-    diff_rows_display <- nrow(table_df2_display) - nrow(table_df1_display)
-    padding_df_display <- data.frame(
-      County = rep("", diff_rows_display),
-      TotalGrantsFormatted = rep("", diff_rows_display)
-    )
-    table_df1_display <- rbind(table_df1_display, padding_df_display)
-  }
-
-  final_table_df_display <- cbind(table_df1_display, table_df2_display)
-
-  if (ncol(final_table_df_display) == 4) {
-    colnames(final_table_df_display) <- c(
-      "County ",
-      "$ Amount",
-      " County",
-      "$ Amount "
-    )
-  } else if (
-    ncol(final_table_df_display) == 2 && nrow(table_df2_display) == 0
-  ) {
-    colnames(final_table_df_display) <- c("County ", "$ Amount")
-  }
-
-  if (nrow(final_table_df_display) > 0 && ncol(final_table_df_display) > 0) {
-    table_grob_display <- gridExtra::tableGrob(
-      final_table_df_display,
-      rows = NULL,
-      theme = ttheme_minimal
-    )
-    table_title_grob_display <- grid::textGrob(
-      "Table (Top Entries):",
-      gp = grid::gpar(fontsize = 11, fontface = "bold"),
-      hjust = 0,
-      x = 0.05
-    )
-    table_with_title_grob <- gridExtra::arrangeGrob(
-      table_title_grob_display,
-      table_grob_display,
-      ncol = 1,
-      heights = grid::unit.c(
-        unit(2, "lines"),
-        unit(1, "npc") - unit(2, "lines")
-      )
-    )
-  } else {
-    table_with_title_grob <- grid::textGrob(
-      "No grant data for table (display limit).",
-      gp = grid::gpar(fontsize = 10)
-    )
-  }
-}
-
-# --------------------------------------------------------------------------
-# 8. COMBINE MAP, LEGEND, AND TABLE USING PATCHWORK
-# --------------------------------------------------------------------------
-# Wrap grobs for robust patchwork combination
-wrapped_common_legend <- patchwork::wrap_elements(common_legend)
-wrapped_table_with_title <- patchwork::wrap_elements(table_with_title_grob)
-
-# Combine legend and table vertically, applying height proportions
-left_panel <- (wrapped_common_legend / wrapped_table_with_title) +
-  plot_layout(heights = grid::unit.c(unit(0.25, "npc"), unit(0.75, "npc")))
-
-# Combine the left panel and the main map horizontally
-# map_plot_main is already a ggplot object
-final_plot_layout <- left_panel | map_plot_main
-
-# Apply width proportions to the horizontally combined plot
-final_plot <- final_plot_layout +
-  plot_layout(widths = grid::unit.c(unit(1, 'null'), unit(2.5, 'null')))
-
-# Add overall titles
-final_plot_with_titles <- final_plot +
-  plot_annotation(
-    title = "Energy Impact Grant Awards by County - 2024",
-    subtitle = "Calendar Year 2024",
-    theme = theme(
-      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
-      plot.subtitle = element_text(hjust = 0.5, size = 12)
-    )
-  )
-
-print(final_plot_with_titles)
-
-# --------------------------------------------------------------------------
-# 9. SAVE THE MAP (OPTIONAL)
-# --------------------------------------------------------------------------
-ggsave("colorado_grants_map_2024_full.png", plot = final_plot_with_titles, width = 14, height = 9, dpi = 300)
-print("Map saved as colorado_grants_map_2024_full.png")
+# Adjust width/height in ggsave as needed for optimal layout.
+# bg = "white" ensures the background is white if saving as PNG.
